@@ -1,5 +1,22 @@
 # quorumgate
 
+## Always align before building
+
+**Every time work starts — a new prompt, a new stage, a change in direction — go back and forth with clarifying questions before writing code.** Do not jump straight to implementation because the request sounds clear. The goal is confirmed shared scope and a shared picture of what "good" looks like, not a fast start.
+
+Concretely, before starting:
+
+1. **Ask, then wait.** Surface the real decisions — scope boundaries, data shapes, tradeoffs, what's explicitly out — as questions with recommended options. Ask about things where the answer changes what gets built, not things with an obvious default.
+2. **Say what you think the request means** in your own words, including what you are *not* going to build, and let it get corrected before any code exists.
+3. **Re-check against `PRD.md`.** If the request and the PRD appear to disagree, raise it explicitly rather than picking one — the PRD wins on scope, but the user may be deliberately changing course.
+4. **Re-align mid-stage** if something surfaces that changes the shape of the work (a spec ambiguity, a dependency that doesn't exist, a design fork). Stop and ask rather than deciding unilaterally and continuing.
+
+A stage that gets built fast in the wrong direction costs more than the questions would have. This rule applies even when the next step looks obvious from the stage plan.
+
+## Learn from what already went wrong
+
+Use the **`build-journal`** skill (`.claude/skills/build-journal/`). Read it before starting a stage or debugging a failure, and append an entry whenever a wrong assumption, environment gotcha, misleading "pass" signal, or user correction costs time. The point is that no mistake in this build gets made twice.
+
 ## Source of truth
 
 **[`PRD.md`](PRD.md) is the source of truth for this project.** It is the complete build spec — architecture, technology choices, API contract, data shapes, and the mandatory stage-gated build plan. If anything here, in the README, or in any skill ever conflicts with `PRD.md`, `PRD.md` wins. Read it in full before doing any work in this repo.
