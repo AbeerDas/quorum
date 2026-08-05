@@ -53,6 +53,45 @@ More generally: when a check is supposed to prove a version/config constraint, r
 log for what actually executed. A passing job is evidence the job passed, not evidence
 the constraint held.
 
+### Floating-point math is not identical across CPU architectures (Stage 1)
+
+**What happened:** The limiter's refill is `tokens + Limit*(elapsed/Window)`. Inspecting
+the compiler output showed arm64 emitting `FMADDD` (one fused multiply-add, rounds once)
+and amd64 emitting `MULSD`+`ADDSD` (rounds twice). Measured over 5M realistic inputs, the
+two forms give different answers **21.5% of the time**. Nodes on different CPUs applying
+an identical Raft log would compute different balances and silently diverge — breaking
+`PRD.md` Section 14's determinism requirement and Section 9's "all nodes identical" test.
+
+**Why:** The Go spec permits an implementation to fuse a multiply followed by an add into
+a single operation, and arm64 has the instruction while amd64 does not. Nothing in the
+source hints at it; the divergence is invisible above the assembly.
+
+**Rule going forward:** anything that lands in replicated state must be arithmetic that is
+bit-identical everywhere. Force the rounding with an explicit `float64(...)` conversion
+around any product that feeds an addition, and keep a test pinned to values where the two
+forms actually disagree (`TestRefillArithmeticIsNotFused`). More broadly: "same source, same
+inputs" does not imply "same result" — the target architecture is part of the input. Check
+this for every future float that crosses a node boundary.
+
+### A measurement can be silently broken by the effect it is measuring (Stage 1)
+
+**What happened:** Chasing the issue above, three claims in a row were wrong. First, a code
+comment asserted one refill formula avoided a precision bug — a direct test showed both
+formulas gave identical results. Second, a rewritten test suggested the *opposite* formula
+was worse. Third, a 20-million-sample sweep reported **0%** divergence between fused and
+unfused math, which looked like proof there was no problem at all. That 0% was itself the
+bug: the "unfused" comparison expression was being fused by the same compiler optimization,
+so it compared fused against fused. Pinning the comparison changed 0% to 21.5%.
+
+**Why:** The experiment ran inside the environment whose behavior was in question, so the
+thing being tested silently applied to the test's own control case. A clean-looking result
+was mistaken for a verified one.
+
+**Rule going forward:** when a result *disproves* a suspected problem, be more suspicious of
+the experiment than relieved by the answer — especially a suspiciously round zero. Verify the
+control is actually a control. And never write a confident causal claim into a code comment
+without having run the thing that demonstrates it; "plausible mechanism" is not evidence.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

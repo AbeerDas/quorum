@@ -13,6 +13,16 @@ Concretely, before starting:
 
 A stage that gets built fast in the wrong direction costs more than the questions would have. This rule applies even when the next step looks obvious from the stage plan.
 
+## Explain in plain language
+
+The user owns the decisions on this project but is not deep in Go internals, distributed-systems theory, or low-level details. **Explanations and questions must be understandable without that background.**
+
+- Lead with what it means for the project — what breaks, what it costs, what the user would notice — before any mechanism.
+- No unexplained jargon. If a term is genuinely needed, gloss it in plain English the first time.
+- When asking the user to choose, describe each option by its **consequence**, not its implementation. "One-line change, already tested, nothing else moves" beats naming the technique.
+- Reach for an analogy when it makes the stakes clearer, and keep the precise version available if the user wants it.
+- Never make the user decode a wall of technical output to answer a question. Do that reading and hand over the conclusion.
+
 ## Learn from what already went wrong
 
 Use the **`build-journal`** skill (`.claude/skills/build-journal/`). Read it before starting a stage or debugging a failure, and append an entry whenever a wrong assumption, environment gotcha, misleading "pass" signal, or user correction costs time. The point is that no mistake in this build gets made twice.
