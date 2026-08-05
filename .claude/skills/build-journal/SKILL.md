@@ -92,6 +92,21 @@ the experiment than relieved by the answer — especially a suspiciously round z
 control is actually a control. And never write a confident causal claim into a code comment
 without having run the thing that demonstrates it; "plausible mechanism" is not evidence.
 
+### A full disk fails as a build error, not a disk error (Stage 2)
+
+**What happened:** `go test -race ./...` failed with `link: mapping output file failed: no
+space left on device`, reported as `FAIL ... [build failed]` next to packages that had just
+passed. It reads like a code or toolchain problem. The machine had 202MB free of 228GB.
+
+**Why:** `-race` links much larger binaries than a plain build, so it is usually the first
+thing to fail when space runs out — long after ordinary builds still succeed. The error
+surfaces as a package-level FAIL, which invites debugging the package.
+
+**Rule going forward:** when a build or link step fails on something that just passed, check
+`df -h` before reading any code. `go clean -cache` reclaims a few hundred MB safely (it only
+forces a rebuild). Never conclude a stage gate failed on correctness grounds without first
+ruling out the environment.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

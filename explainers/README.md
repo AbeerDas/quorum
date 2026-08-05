@@ -12,6 +12,7 @@ Each one answers three things: what got built, how it was proven to work, and wh
 
 - [Stage 1 — the counting engine](stage-1-counting-engine.md)
   - [The chip-rounding bug](stage-1-bug-chip-rounding.md) — found while testing Stage 1
+- [Stage 2 — the front door](stage-2-the-front-door.md)
 
 New stages get a new file here as they're built. Anything notable found along the way gets its own linked write-up, like the bug above.
 
