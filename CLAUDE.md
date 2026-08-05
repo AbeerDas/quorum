@@ -23,6 +23,25 @@ The user owns the decisions on this project but is not deep in Go internals, dis
 - Reach for an analogy when it makes the stakes clearer, and keep the precise version available if the user wants it.
 - Never make the user decode a wall of technical output to answer a question. Do that reading and hand over the conclusion.
 
+## Write an explainer for every stage
+
+`/explainers/` holds plain-language write-ups of what this project is and what was built at each stage. They are the user's material for explaining the work out loud, and they double as the friendliest documentation in the repo.
+
+**Every completed stage gets a new file there** — `stage-N-<short-name>.md` — covering: what got built, how it was proven to work, and what is worth saying about it. Anything notable found along the way (a real bug, a surprising decision) gets its **own linked file**, like `stage-1-bug-chip-rounding.md`, rather than being buried inside the stage write-up. Add every new file to `/explainers/README.md`.
+
+Rules for these files:
+
+- Plain language throughout, per the section above. Analogies are welcome. A reader with no background should follow every sentence.
+- Close each one with an **"If an interviewer asks"** section: the questions this work invites, answered honestly and conversationally.
+- Be truthful about what is not built yet and about mistakes made. A candid write-up of a bug found and fixed is worth more than a clean summary, and honesty is what makes the rest credible.
+- These are distinct from the `build-journal` skill: the journal is the engineering record (root causes, rules to prevent repeats), while explainers are for a human audience.
+
+## Always close the chat with what was written
+
+**Every response that produces work must end by telling the user what was written and framing it for explaining the work out loud.** The user is tracking this project through these summaries, so a response that just says "done" is a failure.
+
+State plainly which files were created or changed and what each one does, then give the interview-facing version: what this work demonstrates, and how to describe it. Skip the jargon; if something technical matters, translate it.
+
 ## Learn from what already went wrong
 
 Use the **`build-journal`** skill (`.claude/skills/build-journal/`). Read it before starting a stage or debugging a failure, and append an entry whenever a wrong assumption, environment gotcha, misleading "pass" signal, or user correction costs time. The point is that no mistake in this build gets made twice.
