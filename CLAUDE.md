@@ -1,0 +1,49 @@
+# quorumgate
+
+## Source of truth
+
+**[`PRD.md`](PRD.md) is the source of truth for this project.** It is the complete build spec — architecture, technology choices, API contract, data shapes, and the mandatory stage-gated build plan. If anything here, in the README, or in any skill ever conflicts with `PRD.md`, `PRD.md` wins. Read it in full before doing any work in this repo.
+
+Do not re-derive scope from first principles or from what "seems reasonable" for a rate limiter — `PRD.md` Section 4 and Section 16 are explicit about what's in scope and what's a scope trap. When in doubt, go re-read the relevant section rather than improvise.
+
+## What this project is
+
+A fault-tolerant distributed rate limiter in Go, using a **hand-rolled Raft consensus protocol** (no `hashicorp/raft`) to replicate rate-limit state across three nodes with automatic leader election and failover. A React dashboard visualizes it, but the dashboard is not the point — see `PRD.md` Section 5 on positioning. Never describe this project, in commits, docs, or code comments, as "a rate limiting dashboard."
+
+## Non-negotiable build discipline
+
+This repo is built in the mandatory stages defined in `PRD.md` Section 12. For every stage:
+
+1. **Do not start a stage until the previous stage's gate is fully checked**, including the git commit, tag, and push to GitHub. The stage tags (`v0.1-scaffold` through `v1.0`) are the record that the build actually worked at each checkpoint — skipping ahead defeats the entire point of the gate structure.
+2. **Write the test first, watch it fail, then implement** — use the `test-driven-development` skill. This matters most in Stage 3 (hand-rolled Raft): a correctness test that passes without ever having failed proves nothing.
+3. **`go test ./...` and `go test -race ./...` must both pass** before any stage is considered done. The race detector is a hard requirement for this codebase, not a nice-to-have — Raft and the limiter both run heavy concurrent/goroutine code.
+4. **Verify before claiming completion** — use the `verification-before-completion` skill. Actually run the stage's validation checklist and read real output. Do not assert a stage is done because the code looks right.
+5. **Debug Raft issues with `systematic-debugging`**, not guesswork. Election and replication bugs are timing-sensitive and intermittent; a fix that isn't hypothesis-driven is easy to get "working" by accident and wrong in production.
+6. **No placeholder values ever** — no `[X]`, `TODO`, `lorem ipsum`, or estimated benchmark numbers in anything that ships. `PRD.md` Section 11 and Section 15 are explicit: benchmark figures must be real measured numbers or the section doesn't get written yet.
+
+## Stage 3 (hand-rolled Raft) gets special treatment
+
+This is the highest-value and highest-risk part of the build (`PRD.md` Section 6, "Why hand-rolled Raft"). Build and test it in isolation from the limiter logic, against the Raft paper's Figure 2. **Do not proceed to Stage 4 until all five correctness tests in `PRD.md` Section 9 pass as real, named, automated tests.** If Raft cannot be made correct, the documented fallback (`PRD.md` Section 16) is to ship through Stage 2 and clearly label it single-node — not to ship a broken cluster with a caveat.
+
+## Explicit non-goals
+
+Do not build any of: disk persistence/WAL, snapshotting, log compaction, multi-Raft, sharding, TLS/auth, a real database, Kubernetes manifests, WebSockets, a gRPC-Web/Envoy proxy. See `PRD.md` Section 16 for why each of these is a scope trap for this build.
+
+## Repo layout
+
+- `/raft` — hand-rolled Raft consensus core (Stage 3)
+- `/limiter` — token-bucket limiter and in-memory store (Stage 1)
+- `/api` — external REST API (Stage 2), gRPC transport for Raft lives alongside `/raft`
+- `/ui` — React/Vite dashboard (Stage 7) — scoped separately, not the project's center of gravity
+- `PRD.md` — the build spec and source of truth
+- `.claude/skills/` — installed skills supporting this build (see below)
+
+## Installed skills
+
+Installed per `PRD.md` Section 18:
+
+- `find-skills` — search for a skill when a gap shows up mid-build rather than improvising
+- `test-driven-development`, `systematic-debugging`, `verification-before-completion`, `using-git-worktrees`, `finishing-a-development-branch` — the discipline layer behind the rules above
+- `golang-concurrency`, `golang-testing`, `golang-grpc`, `golang-observability`, `golang-performance`, `golang-error-handling` — Go implementation skills for Stages 1-5
+- `docker-architect` — Dockerfile/Compose patterns for Stage 6 (closest available match to the PRD's `docker-compose-architecture`; same repo, different skill name)
+- `vite-react-best-practices` — React/Vite patterns for Stage 7

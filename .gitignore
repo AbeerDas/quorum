@@ -1,0 +1,25 @@
+# Claude Code local settings (machine/session-specific, not shared)
+.claude/settings.local.json
+
+# Go
+/bin/
+*.test
+*.out
+vendor/
+
+# Node / React UI
+node_modules/
+dist/
+.vite/
+npm-debug.log*
+
+# Env
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
