@@ -146,6 +146,26 @@ hint was correct behaviour: a node that has heard from nobody genuinely does not
 gap between them. Repeat-running the suite (`-count=25 -race`) is what surfaced this at all;
 a single green run would have shipped it.
 
+### `go get` silently raises the go.mod version floor (Stage 3)
+
+**What happened:** Adding gRPC ran `go get`, which reported `upgraded go 1.22 => 1.25.0` in
+passing. That is the Stage 0 toolchain trap returning by a different route: CI pins
+`go-version: "1.22"`, so a 1.25 floor would have made every CI run silently download a newer
+toolchain again, and the pinned floor would have gone back to meaning nothing. Resetting the
+directive by hand did not hold - `go mod tidy` kept restoring 1.25.
+
+**Why:** gRPC itself only needs Go 1.22.7. The floor was being dragged up by a *transitive*
+dependency, `golang.org/x/net`, whose current release requires 1.25. `go get` resolves to
+newest-compatible and then raises the directive to match whatever that pulled in, so the
+constraint arrives from a package never named in the command.
+
+**Rule going forward:** after any dependency change, re-read the `go` directive before doing
+anything else. When it moved, find the dependency that demands it with
+`go list -m -f '{{.Path}} {{.GoVersion}}' all` rather than guessing, then pin that specific
+module to a contemporaneous release. And verify the floor for real:
+`GOTOOLCHAIN=go1.22.12 go test ./...` runs the build on the exact toolchain CI installs and
+proves no upgrade is triggered, which reading go.mod alone cannot.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`
