@@ -107,6 +107,45 @@ surfaces as a package-level FAIL, which invites debugging the package.
 forces a rebuild). Never conclude a stage gate failed on correctness grounds without first
 ruling out the environment.
 
+### Passing correctness tests proved almost nothing until they were mutation-tested (Stage 3)
+
+**What happened:** All five of `PRD.md` Section 9's correctness tests passed on the first
+run, plus two extras. To check they were real, each safety rule in the implementation was
+deliberately broken one at a time. **Four of six planted violations were caught by nothing.**
+A node could vote twice per term, vote for a candidate missing committed entries, skip the
+log-matching check, or commit an earlier term's entry on replica count alone — and the
+entire suite stayed green.
+
+**Why:** Every test began from a converged cluster and killed a node *cleanly*. No log ever
+genuinely disagreed with another, so the rules that exist solely to resolve disagreement
+were never executed. The tests covered the happy path and tidy failures, which is precisely
+where Raft has no interesting bugs. Adding scenarios that force real divergence — a
+partitioned leader accepting writes it cannot commit, a node rejoining with the highest term
+and the emptiest log, a minority of two that can still confer — took it to 6 of 6.
+
+**Rule going forward:** a correctness test is not evidence until it has been seen to fail
+for the right reason. When implementation precedes tests, mutation testing is the substitute
+for the missing red phase, and it is not optional on anything safety-critical. Also: some
+rules cannot be reached reliably through a live cluster because randomised timing decides
+whether the scenario ever occurs. Drive those against the handler directly — a deterministic
+unit test beats a cluster test that only exercises the rule once in a thousand runs.
+
+### "The cluster has a leader" does not mean the followers know that (Stage 3)
+
+**What happened:** `TestFollowerRejectsDirectWrites` passed hundreds of times, then failed
+on roughly the 15th repeat of the full suite: a follower correctly refused a write but
+reported an empty leader hint instead of naming the leader.
+
+**Why:** The test's `waitForLeader` helper returns as soon as one node reports itself leader.
+A follower does not learn who won by voting — the candidate it backed might still lose — it
+finds out when the first heartbeat arrives. The assertion raced that heartbeat. The empty
+hint was correct behaviour: a node that has heard from nobody genuinely does not know.
+
+**Rule going forward:** wait on the condition actually being asserted, not a proxy for it.
+"A leader exists" and "everyone knows who the leader is" are different states with a real
+gap between them. Repeat-running the suite (`-count=25 -race`) is what surfaced this at all;
+a single green run would have shipped it.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`
