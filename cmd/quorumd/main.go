@@ -24,6 +24,7 @@ import (
 	"github.com/AbeerDas/quorum/api"
 	"github.com/AbeerDas/quorum/cluster"
 	"github.com/AbeerDas/quorum/limiter"
+	"github.com/AbeerDas/quorum/metrics"
 	"github.com/AbeerDas/quorum/raft"
 	"github.com/AbeerDas/quorum/raft/grpctransport"
 )
@@ -81,10 +82,21 @@ func main() {
 		electionMax   = flag.Duration("election-timeout-max", 600*time.Millisecond, "longest wait before a follower calls an election")
 		heartbeat     = flag.Duration("heartbeat", 75*time.Millisecond, "how often the leader heartbeats followers")
 		failoverGrace = flag.Duration("failover-grace", time.Second, "how long a request keeps trying to reach a leader during an election")
+		latencyWindow = flag.Duration("latency-window", 10*time.Second, "how far back the latency percentiles on /status look")
+		logLevel      = flag.String("log-level", "info", "debug, info, warn or error; debug logs every replication round")
 	)
 	flag.Parse()
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+		level = slog.LevelInfo
+	}
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	collector := metrics.New(metrics.Options{
+		NodeID:       *nodeID,
+		RecentWindow: *latencyWindow,
+	})
 
 	if *limit <= 0 || *window <= 0 {
 		logger.Error("invalid configuration", "limit", *limit, "window", window.String())
@@ -140,6 +152,7 @@ func main() {
 			ElectionTimeoutMax: *electionMax,
 			HeartbeatInterval:  *heartbeat,
 			Logger:             logger,
+			Metrics:            collector,
 		})
 
 		lis, err := net.Listen("tcp", *raftAddr)
@@ -170,6 +183,9 @@ func main() {
 			NodeID:        *nodeID,
 			Now:           time.Now,
 			FailoverGrace: *failoverGrace,
+			Metrics:       collector,
+			LatencyWindow: *latencyWindow,
+			Logger:        logger,
 		}).Handler(),
 		// Without this a slow client can hold a connection open indefinitely.
 		ReadHeaderTimeout: 5 * time.Second,

@@ -64,8 +64,9 @@ type Config struct {
 	// followers will start elections against a leader that is perfectly healthy.
 	HeartbeatInterval time.Duration
 
-	Clock  Clock
-	Logger *slog.Logger
+	Clock   Clock
+	Logger  *slog.Logger
+	Metrics Metrics
 }
 
 // Node is one member of a Raft cluster.
@@ -81,6 +82,7 @@ type Node struct {
 	sm          StateMachine
 	clock       Clock
 	logger      *slog.Logger
+	metrics     Metrics
 	electionMin time.Duration
 	electionMax time.Duration
 	heartbeat   time.Duration
@@ -107,6 +109,14 @@ type Node struct {
 	// cannot affect what the nodes agree on.
 	lastContact map[NodeID]time.Time
 
+	// candidateSince times the current election, and committedAt records when
+	// each index was committed, so per-peer replication lag can be measured.
+	candidateSince time.Time
+	committedAt    map[uint64]time.Time
+	// lastLagIndex is the highest index each peer has already been measured
+	// for, so an entry is timed once rather than re-timed by every heartbeat.
+	lastLagIndex map[NodeID]uint64
+
 	wake     chan struct{}
 	applyCh  chan struct{}
 	done     chan struct{}
@@ -131,6 +141,9 @@ func NewNode(cfg Config) *Node {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = cfg.ElectionTimeoutMin / 4
 	}
+	if cfg.Metrics == nil {
+		cfg.Metrics = nopMetrics{}
+	}
 
 	return &Node{
 		id:          cfg.ID,
@@ -139,6 +152,7 @@ func NewNode(cfg Config) *Node {
 		sm:          cfg.StateMachine,
 		clock:       cfg.Clock,
 		logger:      cfg.Logger.With("node_id", string(cfg.ID)),
+		metrics:     cfg.Metrics,
 		electionMin: cfg.ElectionTimeoutMin,
 		electionMax: cfg.ElectionTimeoutMax,
 		heartbeat:   cfg.HeartbeatInterval,
@@ -147,10 +161,12 @@ func NewNode(cfg Config) *Node {
 		role: Follower,
 		// The sentinel lets index 0 mean "before the log began", so PrevLogIndex
 		// needs no special case for an empty log.
-		log:         []LogEntry{{Term: 0, Index: 0}},
-		nextIndex:   make(map[NodeID]uint64),
-		matchIndex:  make(map[NodeID]uint64),
-		lastContact: make(map[NodeID]time.Time),
+		log:          []LogEntry{{Term: 0, Index: 0}},
+		nextIndex:    make(map[NodeID]uint64),
+		matchIndex:   make(map[NodeID]uint64),
+		lastContact:  make(map[NodeID]time.Time),
+		committedAt:  make(map[uint64]time.Time),
+		lastLagIndex: make(map[NodeID]uint64),
 
 		wake:    make(chan struct{}, 1),
 		applyCh: make(chan struct{}, 1),
@@ -315,18 +331,22 @@ func (n *Node) startElection() {
 		return
 	}
 
+	previous := n.role
 	n.role = Candidate
 	n.currentTerm++
 	n.votedFor = n.id
 	n.leaderID = ""
 	n.votes = 1 // its own
+	n.candidateSince = n.clock.Now()
+	n.metrics.RoleChanged(Candidate, n.currentTerm)
 
 	term := n.currentTerm
 	lastIndex, lastTerm := n.lastLogLocked()
 	peers := append([]NodeID(nil), n.peers...)
 	n.mu.Unlock()
 
-	n.logger.Debug("election started", "term", term)
+	n.logger.Info("state transition",
+		"from", previous.String(), "to", Candidate.String(), "term", term, "reason", "election timeout")
 
 	args := &RequestVoteArgs{
 		Term:         term,
@@ -372,16 +392,31 @@ func (n *Node) solicitVote(peer NodeID, term uint64, args *RequestVoteArgs) {
 }
 
 func (n *Node) becomeFollowerLocked(term uint64) {
+	previous := n.role
+
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
 	}
 	n.role = Follower
 	n.leaderID = ""
+
+	if previous != Follower {
+		if previous == Candidate {
+			n.metrics.ElectionSettled(n.currentTerm, n.clock.Now().Sub(n.candidateSince), false)
+		}
+		n.metrics.RoleChanged(Follower, n.currentTerm)
+		n.logger.Info("state transition",
+			"from", previous.String(), "to", Follower.String(),
+			"term", n.currentTerm, "reason", "saw a higher term")
+	}
+
 	n.signalWake()
 }
 
 func (n *Node) becomeLeaderLocked() {
+	took := n.clock.Now().Sub(n.candidateSince)
+
 	n.role = Leader
 	n.leaderID = n.id
 
@@ -394,7 +429,11 @@ func (n *Node) becomeLeaderLocked() {
 	}
 	n.matchIndex[n.id] = lastIndex
 
-	n.logger.Info("became leader", "term", n.currentTerm, "last_log_index", lastIndex)
+	n.metrics.ElectionSettled(n.currentTerm, took, true)
+	n.metrics.RoleChanged(Leader, n.currentTerm)
+	n.logger.Info("election won",
+		"term", n.currentTerm, "took_ms", took.Milliseconds(),
+		"votes", n.votes, "last_log_index", lastIndex)
 	n.signalWake()
 }
 
@@ -448,8 +487,13 @@ func (n *Node) replicateTo(peer NodeID) {
 
 	reply, err := n.transport.AppendEntries(ctx, peer, args)
 	if err != nil {
+		n.logger.Debug("append entries failed", "peer", string(peer), "term", term, "error", err)
 		return
 	}
+	n.logger.Debug("append entries",
+		"peer", string(peer), "term", term,
+		"prev_log_index", prevIndex, "entries", len(entries),
+		"success", reply.Success, "follower_applied", reply.AppliedIndex)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -466,6 +510,8 @@ func (n *Node) replicateTo(peer NodeID) {
 	}
 
 	if reply.Success {
+		n.observeReplicationLagLocked(peer, reply.AppliedIndex)
+
 		match := prevIndex + uint64(len(entries))
 		if match > n.matchIndex[peer] {
 			n.matchIndex[peer] = match
@@ -519,8 +565,47 @@ func (n *Node) advanceCommitLocked() {
 
 		if stored >= n.majority() {
 			n.commitIndex = index
+			n.committedAt[index] = n.clock.Now()
+			n.metrics.CommitIndexAdvanced(index)
 			n.signalApply()
 			return
+		}
+	}
+}
+
+// observeReplicationLagLocked measures how long the follower took to apply what
+// the leader committed. Entries the leader has not committed have no recorded
+// commit time, so they are simply skipped.
+func (n *Node) observeReplicationLagLocked(peer NodeID, followerApplied uint64) {
+	if followerApplied == 0 {
+		return
+	}
+
+	// Measure each index once per peer. Heartbeats keep reporting the same
+	// applied index while the cluster is idle, and timing that repeatedly would
+	// measure "how long since this entry committed" - a number that grows
+	// forever and has nothing to do with replication speed.
+	if followerApplied <= n.lastLagIndex[peer] {
+		return
+	}
+	n.lastLagIndex[peer] = followerApplied
+
+	committedAt, ok := n.committedAt[followerApplied]
+	if !ok {
+		return
+	}
+	n.metrics.ReplicationLag(peer, n.clock.Now().Sub(committedAt))
+
+	// Once every peer has applied an index, its timestamp is dead weight.
+	slowest := followerApplied
+	for _, p := range n.peers {
+		if m := n.matchIndex[p]; m < slowest {
+			slowest = m
+		}
+	}
+	for index := range n.committedAt {
+		if index < slowest {
+			delete(n.committedAt, index)
 		}
 	}
 }
@@ -633,6 +718,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	}
 
 	reply.Success = true
+	reply.AppliedIndex = n.lastApplied
 	return reply
 }
 

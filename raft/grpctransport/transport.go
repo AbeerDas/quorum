@@ -127,6 +127,7 @@ func (t *Transport) AppendEntries(ctx context.Context, to raft.NodeID, args *raf
 		Success:       resp.GetSuccess(),
 		ConflictIndex: resp.GetConflictIndex(),
 		ConflictTerm:  resp.GetConflictTerm(),
+		AppliedIndex:  resp.GetAppliedIndex(),
 	}, nil
 }
 
@@ -188,6 +189,7 @@ func (s *Server) AppendEntries(ctx context.Context, req *raftpb.AppendEntriesReq
 		Success:       reply.Success,
 		ConflictIndex: reply.ConflictIndex,
 		ConflictTerm:  reply.ConflictTerm,
+		AppliedIndex:  reply.AppliedIndex,
 	}, nil
 }
 

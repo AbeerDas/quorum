@@ -15,6 +15,7 @@ Each one answers three things: what got built, how it was proven to work, and wh
 - [Stage 2 — the front door](stage-2-the-front-door.md)
 - [Stage 3 — the consensus core](stage-3-consensus.md) — the centerpiece, and the mutation-testing story
 - [Stage 4 — putting the counter behind consensus](stage-4-replicated-counting.md) — where it became a real distributed system
+- [Stage 5 — making the system explain itself](stage-5-observability.md) — logs, metrics, and three bugs found by reading the numbers
 
 New stages get a new file here as they're built. Anything notable found along the way gets its own linked write-up, like the bug above.
 

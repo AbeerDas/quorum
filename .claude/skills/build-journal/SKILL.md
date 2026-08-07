@@ -202,6 +202,28 @@ before deciding to retry, and never retry the second kind without idempotency ke
 counter this matters more than usual: a lost request is visible to the caller, while a
 double-count is silent and permanent.
 
+### A metric that exists is not a metric that works (Stage 5)
+
+**What happened:** Three of seven metrics were wrong the first time a live cluster was
+inspected. Replication lag read **4.2 seconds** where the true value is ~10ms; peer health
+was defined but never populated by any call site; and latency percentiles reported zero
+samples. Every unit test passed, and the `/metrics` endpoint returned 200 throughout.
+
+**Why:** The lag bug is the instructive one. The leader heartbeats every 75ms, and each
+heartbeat re-reported the same already-applied index, so the measurement was really "time
+since this entry committed" - a quantity that grows without bound while the cluster is idle.
+Nothing in a unit test would notice, because the bug only appears once heartbeats repeat
+over an index that has stopped advancing. The zero-samples case was not a bug at all: the
+requests had aged out of the rolling window before the read. "The code is wrong" and "you
+measured it wrong" look identical until you check.
+
+**Rule going forward:** an endpoint returning 200 is not evidence the numbers in it are
+right. Read every metric under real load and ask whether the magnitude is physically
+plausible before believing it - 4.2 seconds for a loopback round trip should be obviously
+wrong on sight. Check that every collector defined actually has a call site; an unpopulated
+gauge silently reads as zero, which looks like data. And confirm a metric that measures a
+per-event quantity is recorded once per event, not once per report.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

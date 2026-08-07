@@ -54,6 +54,12 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictIndex uint64
 	ConflictTerm  uint64
+
+	// AppliedIndex is how far the follower has applied entries to its state
+	// machine. The leader uses it to measure replication lag as the spec
+	// defines it - commit on the leader through to apply on the follower -
+	// rather than the easier but different "commit through to acknowledged".
+	AppliedIndex uint64
 }
 
 // Transport sends Raft RPCs to other nodes. An error means the peer could not be

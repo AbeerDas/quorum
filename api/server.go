@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/AbeerDas/quorum/limiter"
+	"github.com/AbeerDas/quorum/metrics"
 	"github.com/AbeerDas/quorum/raft"
 )
 
@@ -68,6 +70,18 @@ type statusResponse struct {
 	AllowedTotal   uint64 `json:"allowed_total"`
 	BlockedTotal   uint64 `json:"blocked_total"`
 	UptimeMS       int64  `json:"uptime_ms"`
+
+	// Latency describes recent activity only, so a failover spike shows up and
+	// then recovers rather than being averaged away forever.
+	Latency latencyReport `json:"latency"`
+}
+
+type latencyReport struct {
+	P50MS    float64 `json:"p50_ms"`
+	P95MS    float64 `json:"p95_ms"`
+	P99MS    float64 `json:"p99_ms"`
+	Samples  int     `json:"samples"`
+	WindowMS int64   `json:"window_ms"`
 }
 
 // configRequest is the body of PUT /config.
@@ -94,6 +108,14 @@ type ServerConfig struct {
 	FailoverGrace time.Duration
 
 	HTTPClient *http.Client
+
+	// Metrics collects the measurements in PRD.md Section 10. Nil disables
+	// collection and leaves /metrics unregistered.
+	Metrics *metrics.Collector
+	// LatencyWindow is the span the /status percentiles describe.
+	LatencyWindow time.Duration
+
+	Logger *slog.Logger
 }
 
 // Server exposes the limiter over the REST API in PRD.md Section 13.
@@ -109,6 +131,10 @@ type Server struct {
 	allowed atomic.Uint64
 	blocked atomic.Uint64
 
+	metrics       *metrics.Collector
+	latencyWindow time.Duration
+	logger        *slog.Logger
+
 	mux *http.ServeMux
 }
 
@@ -120,6 +146,12 @@ func NewServer(cfg ServerConfig) *Server {
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: 5 * time.Second}
 	}
+	if cfg.Logger == nil {
+		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if cfg.LatencyWindow <= 0 {
+		cfg.LatencyWindow = 10 * time.Second
+	}
 
 	s := &Server{
 		backend:       cfg.Backend,
@@ -128,12 +160,24 @@ func NewServer(cfg ServerConfig) *Server {
 		started:       cfg.Now(),
 		failoverGrace: cfg.FailoverGrace,
 		client:        cfg.HTTPClient,
+		metrics:       cfg.Metrics,
+		latencyWindow: cfg.LatencyWindow,
+		logger:        cfg.Logger.With("node_id", cfg.NodeID),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/check", s.handleCheck)
 	mux.HandleFunc("/status", s.handleStatus)
 	mux.HandleFunc("/config", s.handleConfig)
+	if cfg.Metrics != nil {
+		// Refresh cluster gauges on the way in, so a scrape always reflects the
+		// node's view right now rather than whenever /status was last polled.
+		collectorHandler := cfg.Metrics.Handler()
+		mux.Handle("/metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			s.refreshClusterGauges()
+			collectorHandler.ServeHTTP(w, r)
+		}))
+	}
 	s.mux = mux
 
 	return s
@@ -161,10 +205,12 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 
 	at := s.now()
 	deadline := at.Add(s.failoverGrace)
+	started := time.Now()
 
 	for {
 		d, err := s.backend.Check(r.Context(), req.CallerID, at)
 		if err == nil {
+			s.recordDecision(d, time.Since(started))
 			s.writeDecision(w, d)
 			return
 		}
@@ -173,6 +219,20 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// recordDecision measures one completed decision. Latency is taken from the
+// real clock rather than the injectable one: it is a measurement of this
+// machine, not part of replicated state.
+func (s *Server) recordDecision(d limiter.Decision, took time.Duration) {
+	if s.metrics == nil {
+		return
+	}
+	outcome := metrics.Allowed
+	if !d.Allowed {
+		outcome = metrics.Blocked
+	}
+	s.metrics.ObserveRequest(outcome, took)
 }
 
 // handleConfig changes the limit across the cluster.
@@ -243,7 +303,34 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		AllowedTotal:   s.allowed.Load(),
 		BlockedTotal:   s.blocked.Load(),
 		UptimeMS:       at.Sub(s.started).Milliseconds(),
+		Latency:        s.latencyReport(),
 	})
+}
+
+// refreshClusterGauges publishes the node's current view of its peers.
+func (s *Server) refreshClusterGauges() {
+	if s.metrics == nil {
+		return
+	}
+	for _, p := range s.backend.Status(s.now()).Peers {
+		s.metrics.SetPeerHealthy(raft.NodeID(p.NodeID), p.Healthy)
+	}
+}
+
+// latencyReport describes recent request latency for the dashboard.
+func (s *Server) latencyReport() latencyReport {
+	if s.metrics == nil {
+		return latencyReport{WindowMS: s.latencyWindow.Milliseconds()}
+	}
+	p := s.metrics.RecentLatency()
+	ms := func(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
+	return latencyReport{
+		P50MS:    ms(p.P50),
+		P95MS:    ms(p.P95),
+		P99MS:    ms(p.P99),
+		Samples:  p.Samples,
+		WindowMS: s.latencyWindow.Milliseconds(),
+	}
 }
 
 // tryForward handles a backend error, passing the request to the leader when
@@ -255,9 +342,12 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 func (s *Server) tryForward(w http.ResponseWriter, r *http.Request, err error, body any, deadline time.Time) bool {
 	var notLeader *raft.NotLeaderError
 	if !errors.As(err, &notLeader) {
+		s.observeRejection(metrics.ReasonNoLeader)
+		s.logger.Warn("request could not be completed", "error", err)
 		s.writeError(w, http.StatusServiceUnavailable, "could not complete the request: "+err.Error())
 		return true
 	}
+	s.observeRejection(metrics.ReasonWrongNode)
 
 	// Already passed on once and this node still is not the leader: leadership
 	// is moving faster than the request can chase it.
@@ -294,6 +384,12 @@ func (s *Server) tryForward(w http.ResponseWriter, r *http.Request, err error, b
 
 	s.writeError(w, http.StatusServiceUnavailable, "could not reach the leader: "+forwardErr.Error())
 	return true
+}
+
+func (s *Server) observeRejection(reason metrics.RejectReason) {
+	if s.metrics != nil {
+		s.metrics.ObserveRejection(reason)
+	}
 }
 
 // forward sends the request on to the leader and copies its reply back, so the
@@ -354,6 +450,9 @@ func (s *Server) writeDecision(w http.ResponseWriter, d limiter.Decision) {
 	}
 
 	s.blocked.Add(1)
+	s.logger.Debug("request rejected",
+		"reason", string(metrics.ReasonOverLimit),
+		"retry_after_ms", d.RetryAfter.Milliseconds())
 
 	// Round the header up to whole seconds: telling a client "retry after 0s"
 	// invites an immediate retry that is certain to be refused again.
