@@ -35,7 +35,12 @@ func (c *fakeClock) Advance(d time.Duration) {
 func newTestServer(t *testing.T, cfg limiter.Config) (*Server, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{t: t0}
-	return NewServer(limiter.New(cfg), "node-test", clock.Now), clock
+	srv := NewServer(ServerConfig{
+		Backend: NewSingleNodeBackend(limiter.New(cfg), "node-test"),
+		NodeID:  "node-test",
+		Now:     clock.Now,
+	})
+	return srv, clock
 }
 
 // do issues a request against the server and returns the recorder.
@@ -61,6 +66,8 @@ func do(t *testing.T, s *Server, method, path string, body any) *httptest.Respon
 	s.Handler().ServeHTTP(rec, req)
 	return rec
 }
+
+func stringReader(s string) *bytes.Reader { return bytes.NewReader([]byte(s)) }
 
 func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	t.Helper()

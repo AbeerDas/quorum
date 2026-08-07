@@ -166,6 +166,42 @@ module to a contemporaneous release. And verify the floor for real:
 `GOTOOLCHAIN=go1.22.12 go test ./...` runs the build on the exact toolchain CI installs and
 proves no upgrade is triggered, which reading go.mod alone cannot.
 
+### The untested code is always the code that only runs when things go wrong (Stage 4)
+
+**What happened:** Mutation testing on the replicated limiter caught 3 of 5 planted
+violations. The two that survived were the two rules that prevent double-counting: accepting
+a superseded proposal as success, and retrying a request whose outcome is unknown. Every
+other test passed with both rules deleted. This is the second stage running where mutation
+testing found exactly this shape of gap - Stage 3 caught only 2 of 6 for the same underlying
+reason.
+
+**Why:** Both rules execute only when leadership changes *during a single request*. The
+cluster tests killed the leader between requests, which is easy to arrange and exercises
+none of that code. Naturally-written tests cover the tidy path; the dangerous code lives in
+the untidy one, and timing decides whether a live cluster ever reaches it.
+
+**Rule going forward:** when a rule only fires in a narrow race, do not rely on an
+integration test stumbling into it. Put the dependency behind a small interface and drive the
+scenario directly - here, a fake node that scripts a proposal's fate. Ask of every safety
+rule: "what has to go wrong for this line to run, and does any test make that happen?" If the
+answer is timing, write the unit test.
+
+### A retry is only safe when you can prove the first attempt did nothing (Stage 4)
+
+**What happened:** Building automatic retry for a smooth failover, the obvious design -
+retry whenever a request fails - would silently double-count. A timeout does not mean the
+command failed; it means the outcome is unknown, and the command may well have committed.
+
+**Why:** Retrying is safe only with proof of non-execution. Three failures carry that proof:
+the node reported it was not the leader (never appended), the connection was refused (never
+delivered), or the entry at that log position now holds a different term (definitively
+discarded). A timeout carries no proof at all.
+
+**Rule going forward:** classify every failure as "provably did not happen" or "unknown"
+before deciding to retry, and never retry the second kind without idempotency keys. For a
+counter this matters more than usual: a lost request is visible to the caller, while a
+double-count is silent and permanent.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

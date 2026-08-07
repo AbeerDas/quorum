@@ -14,6 +14,7 @@ Each one answers three things: what got built, how it was proven to work, and wh
   - [The chip-rounding bug](stage-1-bug-chip-rounding.md) — found while testing Stage 1
 - [Stage 2 — the front door](stage-2-the-front-door.md)
 - [Stage 3 — the consensus core](stage-3-consensus.md) — the centerpiece, and the mutation-testing story
+- [Stage 4 — putting the counter behind consensus](stage-4-replicated-counting.md) — where it became a real distributed system
 
 New stages get a new file here as they're built. Anything notable found along the way gets its own linked write-up, like the bug above.
 

@@ -75,16 +75,16 @@ type Config struct {
 // what it needs, releases the lock, makes the call, then re-acquires and
 // re-checks that the world has not moved on underneath it.
 type Node struct {
-	id           NodeID
-	peers        []NodeID
-	transport    Transport
-	sm           StateMachine
-	clock        Clock
-	logger       *slog.Logger
-	electionMin  time.Duration
-	electionMax  time.Duration
-	heartbeat    time.Duration
-	rpcTimeout   time.Duration
+	id          NodeID
+	peers       []NodeID
+	transport   Transport
+	sm          StateMachine
+	clock       Clock
+	logger      *slog.Logger
+	electionMin time.Duration
+	electionMax time.Duration
+	heartbeat   time.Duration
+	rpcTimeout  time.Duration
 
 	mu          sync.Mutex
 	role        Role
@@ -101,6 +101,11 @@ type Node struct {
 	nextIndex  map[NodeID]uint64
 	matchIndex map[NodeID]uint64
 	votes      int
+
+	// lastContact records when each peer last answered. Purely observational -
+	// it is read from the wall clock and never enters replicated state, so it
+	// cannot affect what the nodes agree on.
+	lastContact map[NodeID]time.Time
 
 	wake     chan struct{}
 	applyCh  chan struct{}
@@ -142,9 +147,10 @@ func NewNode(cfg Config) *Node {
 		role: Follower,
 		// The sentinel lets index 0 mean "before the log began", so PrevLogIndex
 		// needs no special case for an empty log.
-		log:        []LogEntry{{Term: 0, Index: 0}},
-		nextIndex:  make(map[NodeID]uint64),
-		matchIndex: make(map[NodeID]uint64),
+		log:         []LogEntry{{Term: 0, Index: 0}},
+		nextIndex:   make(map[NodeID]uint64),
+		matchIndex:  make(map[NodeID]uint64),
+		lastContact: make(map[NodeID]time.Time),
 
 		wake:    make(chan struct{}, 1),
 		applyCh: make(chan struct{}, 1),
@@ -188,6 +194,20 @@ func (n *Node) LeaderID() NodeID {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.leaderID
+}
+
+// PeerLastContact reports when each peer was last heard from. Only a leader
+// contacts peers, so a follower reports nothing - absence means "not known
+// from here", not "unhealthy".
+func (n *Node) PeerLastContact() map[NodeID]time.Time {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	out := make(map[NodeID]time.Time, len(n.lastContact))
+	for id, at := range n.lastContact {
+		out[id] = at
+	}
+	return out
 }
 
 // CommitIndex is the highest log position known to be safely replicated.
@@ -433,6 +453,9 @@ func (n *Node) replicateTo(peer NodeID) {
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
+
+	// The peer answered, whatever the answer was.
+	n.lastContact[peer] = n.clock.Now()
 
 	if reply.Term > n.currentTerm {
 		n.becomeFollowerLocked(reply.Term)

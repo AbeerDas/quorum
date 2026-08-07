@@ -1,15 +1,31 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/AbeerDas/quorum/limiter"
+	"github.com/AbeerDas/quorum/raft"
 )
+
+// leaderRouter is implemented by a backend that knows where its peers' APIs
+// live, so a write that landed on a follower can be passed to the leader.
+type leaderRouter interface {
+	PeerAddr(id raft.NodeID) (string, bool)
+}
+
+// forwardedHeader marks a request that has already been passed on once. A
+// second hop means leadership moved again mid-flight, and bouncing further
+// risks a request circling the cluster instead of failing honestly.
+const forwardedHeader = "X-Quorum-Forwarded"
 
 // checkRequest is the body of POST /check.
 type checkRequest struct {
@@ -24,25 +40,26 @@ type checkResponse struct {
 	RetryAfterMS int64 `json:"retry_after_ms,omitempty"`
 }
 
-// peerStatus describes one other node in the cluster. No peers exist until Raft
-// lands in Stage 3; the shape is fixed now so the dashboard does not have to be
-// rewritten when they appear.
+// peerStatus describes one other node in the cluster.
 type peerStatus struct {
-	NodeID     string `json:"node_id"`
-	Address    string `json:"address"`
-	Healthy    bool   `json:"healthy"`
-	LastSeenMS int64  `json:"last_seen_ms"`
+	NodeID  string `json:"node_id"`
+	Address string `json:"address,omitempty"`
+	Healthy bool   `json:"healthy"`
+	// LastSeenMS is milliseconds since this node last heard from the peer, or
+	// -1 when unknown. Only a leader contacts peers, so a follower reports -1.
+	LastSeenMS int64 `json:"last_seen_ms"`
 }
 
 // statusResponse is the body of GET /status.
 type statusResponse struct {
 	NodeID string `json:"node_id"`
-	// Mode is "single-node" until a cluster exists, so no reader mistakes this
-	// for an elected leader.
-	Mode  string       `json:"mode"`
-	Role  string       `json:"role"`
-	Term  uint64       `json:"term"`
-	Peers []peerStatus `json:"peers"`
+	// Mode is "single-node" until a cluster exists, so no reader mistakes a
+	// lone node for an elected leader.
+	Mode     string       `json:"mode"`
+	Role     string       `json:"role"`
+	Term     uint64       `json:"term"`
+	LeaderID string       `json:"leader_id"`
+	Peers    []peerStatus `json:"peers"`
 
 	Limit    int   `json:"limit"`
 	WindowMS int64 `json:"window_ms"`
@@ -63,19 +80,31 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-// Server exposes the limiter over the REST API described in PRD.md Section 13.
-//
-// This is the single-node form: there is no cluster, so /status reports mode
-// "single-node" rather than implying an election has taken place.
+// ServerConfig describes one node's HTTP API.
+type ServerConfig struct {
+	Backend Backend
+	NodeID  string
+
+	// Now supplies the instant each request is judged at. Nil means time.Now.
+	Now func() time.Time
+
+	// FailoverGrace is how long a request may keep trying to reach a leader
+	// while one is being elected, before giving up and returning an error.
+	// Zero disables retrying.
+	FailoverGrace time.Duration
+
+	HTTPClient *http.Client
+}
+
+// Server exposes the limiter over the REST API in PRD.md Section 13.
 type Server struct {
-	limiter *limiter.Limiter
+	backend Backend
 	nodeID  string
 
-	// now supplies the current instant. The limiter never reads a clock itself,
-	// so time enters the system here and nowhere else, which keeps handlers
-	// testable without sleeping.
-	now     func() time.Time
-	started time.Time
+	now           func() time.Time
+	started       time.Time
+	failoverGrace time.Duration
+	client        *http.Client
 
 	allowed atomic.Uint64
 	blocked atomic.Uint64
@@ -83,17 +112,22 @@ type Server struct {
 	mux *http.ServeMux
 }
 
-// NewServer wires l behind the REST API. A nil now defaults to time.Now.
-func NewServer(l *limiter.Limiter, nodeID string, now func() time.Time) *Server {
-	if now == nil {
-		now = time.Now
+// NewServer wires a backend behind the REST API.
+func NewServer(cfg ServerConfig) *Server {
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.HTTPClient == nil {
+		cfg.HTTPClient = &http.Client{Timeout: 5 * time.Second}
 	}
 
 	s := &Server{
-		limiter: l,
-		nodeID:  nodeID,
-		now:     now,
-		started: now(),
+		backend:       cfg.Backend,
+		nodeID:        cfg.NodeID,
+		now:           cfg.Now,
+		started:       cfg.Now(),
+		failoverGrace: cfg.FailoverGrace,
+		client:        cfg.HTTPClient,
 	}
 
 	mux := http.NewServeMux()
@@ -125,61 +159,23 @@ func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	d := s.limiter.Allow(req.CallerID, s.now())
+	at := s.now()
+	deadline := at.Add(s.failoverGrace)
 
-	if d.Allowed {
-		s.allowed.Add(1)
-		s.writeJSON(w, http.StatusOK, checkResponse{Allowed: true, Remaining: d.Remaining})
-		return
+	for {
+		d, err := s.backend.Check(r.Context(), req.CallerID, at)
+		if err == nil {
+			s.writeDecision(w, d)
+			return
+		}
+
+		if done := s.tryForward(w, r, err, req, deadline); done {
+			return
+		}
 	}
-
-	s.blocked.Add(1)
-
-	// Round the header up to whole seconds: telling a client "retry after 0s"
-	// invites an immediate retry that is certain to be refused again.
-	retryAfterSec := int64(math.Ceil(d.RetryAfter.Seconds()))
-	if retryAfterSec < 1 {
-		retryAfterSec = 1
-	}
-	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSec, 10))
-
-	s.writeJSON(w, http.StatusTooManyRequests, checkResponse{
-		Allowed:      false,
-		Remaining:    d.Remaining,
-		RetryAfterMS: d.RetryAfter.Milliseconds(),
-	})
 }
 
-// handleStatus reports this node's health and current limit.
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed, use GET")
-		return
-	}
-
-	cfg := s.limiter.Config()
-
-	s.writeJSON(w, http.StatusOK, statusResponse{
-		NodeID: s.nodeID,
-		Mode:   "single-node",
-		// The only node in the system is by definition the one accepting writes.
-		// Mode above makes clear this was not won in an election.
-		Role: "leader",
-		// No election has happened, so the term is genuinely zero.
-		Term:  0,
-		Peers: []peerStatus{},
-
-		Limit:    cfg.Limit,
-		WindowMS: cfg.Window.Milliseconds(),
-
-		TrackedCallers: s.limiter.Len(),
-		AllowedTotal:   s.allowed.Load(),
-		BlockedTotal:   s.blocked.Load(),
-		UptimeMS:       s.now().Sub(s.started).Milliseconds(),
-	})
-}
-
-// handleConfig changes the limit while the server is running.
+// handleConfig changes the limit across the cluster.
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed, use PUT")
@@ -200,16 +196,177 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Start from the live config so unrelated settings, such as eviction, are
-	// carried over rather than silently reset to their zero values.
-	cfg := s.limiter.Config()
-	cfg.Limit = req.Limit
-	cfg.Window = time.Duration(req.WindowMS) * time.Millisecond
-	s.limiter.SetConfig(cfg)
+	at := s.now()
+	deadline := at.Add(s.failoverGrace)
+	window := time.Duration(req.WindowMS) * time.Millisecond
 
-	s.writeJSON(w, http.StatusOK, configRequest{
+	for {
+		err := s.backend.SetLimit(r.Context(), req.Limit, window, at)
+		if err == nil {
+			s.writeJSON(w, http.StatusOK, configRequest{Limit: req.Limit, WindowMS: req.WindowMS})
+			return
+		}
+
+		if done := s.tryForward(w, r, err, req, deadline); done {
+			return
+		}
+	}
+}
+
+// handleStatus reports this node's health, role, and current limit.
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed, use GET")
+		return
+	}
+
+	at := s.now()
+	st := s.backend.Status(at)
+	cfg := s.backend.Config()
+
+	if st.Peers == nil {
+		st.Peers = []peerStatus{}
+	}
+
+	s.writeJSON(w, http.StatusOK, statusResponse{
+		NodeID:   st.NodeID,
+		Mode:     st.Mode,
+		Role:     st.Role,
+		Term:     st.Term,
+		LeaderID: st.LeaderID,
+		Peers:    st.Peers,
+
 		Limit:    cfg.Limit,
 		WindowMS: cfg.Window.Milliseconds(),
+
+		TrackedCallers: s.backend.TrackedCallers(),
+		AllowedTotal:   s.allowed.Load(),
+		BlockedTotal:   s.blocked.Load(),
+		UptimeMS:       at.Sub(s.started).Milliseconds(),
+	})
+}
+
+// tryForward handles a backend error, passing the request to the leader when
+// that is what the error calls for. It reports whether the response is finished.
+//
+// Returning false means "try the backend again": the only case where that
+// happens is a leader that turned out to be down, which is definitively a
+// request that never arrived anywhere and so is safe to send again.
+func (s *Server) tryForward(w http.ResponseWriter, r *http.Request, err error, body any, deadline time.Time) bool {
+	var notLeader *raft.NotLeaderError
+	if !errors.As(err, &notLeader) {
+		s.writeError(w, http.StatusServiceUnavailable, "could not complete the request: "+err.Error())
+		return true
+	}
+
+	// Already passed on once and this node still is not the leader: leadership
+	// is moving faster than the request can chase it.
+	if r.Header.Get(forwardedHeader) != "" {
+		s.writeError(w, http.StatusServiceUnavailable, "leadership changed while the request was in flight, retry")
+		return true
+	}
+
+	router, ok := s.backend.(leaderRouter)
+	if !ok || notLeader.Leader == "" {
+		s.writeError(w, http.StatusServiceUnavailable, "no leader is currently available, retry shortly")
+		return true
+	}
+
+	addr, known := router.PeerAddr(notLeader.Leader)
+	if !known {
+		s.writeError(w, http.StatusServiceUnavailable, "leader "+string(notLeader.Leader)+" has no configured address")
+		return true
+	}
+
+	forwardErr := s.forward(w, r, addr, body)
+	if forwardErr == nil {
+		return true
+	}
+
+	// The connection was refused, so the request was never delivered and
+	// cannot have taken effect. That is the one failure it is safe to retry.
+	// Any other failure leaves it unknown whether the leader applied it, and
+	// retrying an unknown is how a request gets counted twice.
+	if isDialFailure(forwardErr) && s.now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		return false
+	}
+
+	s.writeError(w, http.StatusServiceUnavailable, "could not reach the leader: "+forwardErr.Error())
+	return true
+}
+
+// forward sends the request on to the leader and copies its reply back, so the
+// caller never has to know which node it reached.
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, addr string, body any) error {
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method,
+		"http://"+addr+r.URL.Path, bytes.NewReader(encoded))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(forwardedHeader, "1")
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if v := resp.Header.Get("Retry-After"); v != "" {
+		w.Header().Set("Retry-After", v)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+
+	// Count the outcome here too, so a node's totals reflect the traffic it
+	// served rather than only what it decided itself.
+	if resp.StatusCode == http.StatusTooManyRequests {
+		s.blocked.Add(1)
+	} else if resp.StatusCode == http.StatusOK && r.URL.Path == "/check" {
+		s.allowed.Add(1)
+	}
+
+	_, err = io.Copy(w, resp.Body)
+	return err
+}
+
+// isDialFailure reports whether the connection was never established, which
+// means the request certainly did not arrive.
+func isDialFailure(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return opErr.Op == "dial"
+	}
+	return false
+}
+
+func (s *Server) writeDecision(w http.ResponseWriter, d limiter.Decision) {
+	if d.Allowed {
+		s.allowed.Add(1)
+		s.writeJSON(w, http.StatusOK, checkResponse{Allowed: true, Remaining: d.Remaining})
+		return
+	}
+
+	s.blocked.Add(1)
+
+	// Round the header up to whole seconds: telling a client "retry after 0s"
+	// invites an immediate retry that is certain to be refused again.
+	retryAfterSec := int64(math.Ceil(d.RetryAfter.Seconds()))
+	if retryAfterSec < 1 {
+		retryAfterSec = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSec, 10))
+
+	s.writeJSON(w, http.StatusTooManyRequests, checkResponse{
+		Allowed:      false,
+		Remaining:    d.Remaining,
+		RetryAfterMS: d.RetryAfter.Milliseconds(),
 	})
 }
 
