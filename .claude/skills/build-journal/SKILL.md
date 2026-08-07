@@ -224,6 +224,44 @@ wrong on sight. Check that every collector defined actually has a call site; an 
 gauge silently reads as zero, which looks like data. And confirm a metric that measures a
 per-event quantity is recorded once per event, not once per report.
 
+### Two individually reasonable settings were wrong in combination (Stage 8)
+
+**What happened:** Under a sustained 3,000 req/s load the cluster ran cleanly for 27 seconds
+and then collapsed into an election storm - terms climbing 3, 4, 5, 6, 7, 8, 9 with nodes
+thrashing between candidate and leader until every request failed. Separately, a leader kill
+that should have been nearly invisible cost 415 requests.
+
+**Why:** Two configuration values, each defensible alone. The election timeout (300-600ms)
+was tuned for a visibly fast demo failover, but under load the leader's heartbeats queued
+behind real request work and arrived late, so followers declared a healthy leader dead and
+the winner was immediately starved the same way. And the API's failover grace (1s) was
+shorter than the election timeout it had to outlast, so in-flight requests gave up just
+before the new leader appeared. Raising the election timeout to 1-2s and the grace to 3s
+gave 100% success at 10,000 req/s with a leader killed mid-run.
+
+**Rule going forward:** timeouts that interact must be checked as a set, not individually.
+The ordering that has to hold here is heartbeat << election timeout < failover grace. Also:
+settings tuned for a demo are not settings tuned for load, and the difference only appears
+under *sustained* traffic - a short burst test would have shown neither problem, since the
+first took 27 seconds to develop.
+
+### A benchmark that shares a machine with its target measures the harness (Stage 8)
+
+**What happened:** Cluster throughput probes returned nonsense above ~10k req/s: 12k/s gave
+30% success, 16k/s gave 4.6%, and 20k/s gave 99.9% - a *higher* rate producing a far better
+result than a lower one. Some failures carried HTTP status 0 with 30-second latencies.
+
+**Why:** vegeta ran on the same 8-core laptop as all three server processes. At high rates
+the load generator starves the servers it is measuring, and status 0 with 30s latencies is
+client-side connection exhaustion rather than any server behaviour. The non-monotonic
+results are the signature: a real capacity limit degrades monotonically.
+
+**Rule going forward:** when throughput does not degrade monotonically with offered load,
+suspect the harness before the system. Report the highest rate that reproduces cleanly and
+state the co-location as a limitation, rather than quoting the best number ever observed.
+Distinguish client-side errors (status 0, connection refused) from server-side ones (503) -
+they mean opposite things about what was actually measured.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

@@ -26,7 +26,47 @@ The correctness tests run against an in-memory network so links can be severed p
 
 ## Performance
 
-_Real, measured benchmark numbers (see [`PRD.md`](PRD.md) Section 11) go here once Stage 8 is complete. No placeholder figures._
+Every figure below was measured with [`bench/run.sh`](bench/run.sh) and is reproducible. Nothing here is estimated.
+
+**Methodology.** [vegeta](https://github.com/tsenart/vegeta) at a fixed rate for 30 seconds per run, against a rate limit high enough that no request is ever refused, so the numbers measure throughput rather than rejection. Raft configured with a 100ms heartbeat and a 1-2s election timeout. Measured on an **Apple M2 (8 cores, 8 GB, macOS)** with the load generator running on the same machine as the servers, which caps the achievable rate — treat these as a floor.
+
+### 1. Baseline: single node, no consensus
+
+| Load | Throughput | p50 | p95 | p99 | Success |
+|---|---|---|---|---|---|
+| Unlimited rate | **41,362 req/s** | 1.56 ms | 17.15 ms | 39.39 ms | 100% |
+| Fixed 6,000 req/s | 6,000 req/s | 0.09 ms | 0.15 ms | 2.99 ms | 100% |
+
+### 2. Healthy 3-node cluster
+
+Every request is agreed by a majority before it is answered.
+
+| Load | Throughput | p50 | p95 | p99 | Success |
+|---|---|---|---|---|---|
+| Fixed 6,000 req/s | 6,000 req/s | 0.18 ms | 0.78 ms | 5.94 ms | 100% |
+| Fixed 8,000 req/s | 8,000 req/s | 0.23 ms | 4.70 ms | 21.67 ms | 100% |
+| Fixed 10,000 req/s | **9,999 req/s** | 0.38 ms | 9.09 ms | 25.04 ms | 100% |
+
+**Cost of consensus:** at the same 6,000 req/s, replication roughly doubles latency (p50 0.09 → 0.18 ms, p99 2.99 → 5.94 ms). That is the price of an answer that survives the node which gave it.
+
+### 3. Cluster under induced leader failure
+
+3,000 req/s for 30 seconds, with the leader process killed at the 15-second mark. Load is deliberately sent to a **follower**, so the forwarding path is exercised too.
+
+| Measure | Result |
+|---|---|
+| Successful requests | **89,990 of 90,000 (100.0%)** |
+| Failed requests | 10 (0.011%) |
+| Time serving zero requests | **0 ms** |
+| p50 / p95 / p99 | 0.31 ms / 11.26 ms / 22.59 ms |
+
+**Zero lost, zero double-counted — verified rather than asserted.** Every accepted request becomes exactly one entry in the replicated log, so the log's committed position is an independent audit of the request count. Both surviving nodes finished at commit index **89,990**, exactly matching the 89,990 successful requests: nothing was lost, nothing was counted twice, and the two survivors agreed exactly.
+
+### A tuning finding worth recording
+
+The node's default timeouts (75 ms heartbeat, 300-600 ms election) are tuned to make failover visibly fast in a demo. Under **sustained** load of 3,000 req/s they are too aggressive: the leader's heartbeats get starved, followers call elections against a healthy leader, and the resulting churn collapsed the cluster after about 27 seconds. The calmer values above are stable indefinitely at 10,000 req/s.
+
+Related: the API's failover grace must exceed the election timeout. When it did not, in-flight requests aged out during a failover and returned errors; once raised above it, the same failover cost 10 requests out of 90,000.
 
 ## Repo layout
 

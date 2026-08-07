@@ -714,6 +714,7 @@ func (n *Node) HandleAppendEntries(args *AppendEntriesArgs) *AppendEntriesReply 
 	if args.LeaderCommit > n.commitIndex {
 		lastIndex, _ = n.lastLogLocked()
 		n.commitIndex = min(args.LeaderCommit, lastIndex)
+		n.metrics.CommitIndexAdvanced(n.commitIndex)
 		n.signalApply()
 	}
 
