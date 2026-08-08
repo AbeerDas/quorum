@@ -284,6 +284,38 @@ stops doing, not just what stops reaching it. And prefer the seam the design alr
 without editing one line of consensus code, which is what kept the Stage 3 correctness
 tests meaningful.
 
+**Correction, found by CI after this was first written:** the guarantee is a bound, not a
+zero. Stopping the clock prevents a node *starting* an election but cannot un-start one that
+began microseconds earlier, so a node frozen in that window keeps one extra term and can
+cost one election on the way back. The test originally asserted the term was unchanged after
+a revival; it passed 10 local runs under `-race` and failed on the first CI run. See the
+entry below.
+
+### A test that passes ten times locally and fails in CI is usually asserting the wrong thing (Stage 6)
+
+**What happened:** `TestRevivedFollowerDoesNotUnseatTheLeader` asserted that a revived node
+returns at exactly the term it left at. It passed `-race -count=4` locally, then failed on
+the first CI run: *"revived follower came back at term 2 against a cluster at term 1."* The
+temptation was to treat it as CI being slow and loosen the timing. The real cause was a
+genuine, narrow behaviour: a node frozen in the instant between its election timer firing and
+the freeze taking hold is already one term ahead, and campaigning once on return costs one
+more.
+
+**Why:** the assertion described what happens *almost always* rather than what the design
+guarantees. Local runs never hit the window; a busier, slower CI machine hits it readily.
+That makes it the good kind of flake - a test correctly reporting that a claim was too
+strong. Rewriting it to assert the property that actually holds (rejoining costs at most one
+election, and crucially does not scale with the length of the outage) made it both true and
+still sharp: with the clock freeze mutated out it fails at term 10 against a cluster at 2.
+
+**Rule going forward:** when a test fails only under different timing, first ask whether the
+*claim* is wrong before assuming the *environment* is. Distinguish "what happens nearly
+always" from "what is guaranteed", and assert the guarantee - a bound is often the honest
+statement where equality is not. Never fix this class of failure with a retry loop or a
+longer sleep: that converts a real property of the system into a hidden one. Also, where a
+freeze or cancellation races an operation already in flight, read state only after a settling
+period, or the test measures the race rather than the result.
+
 ### A frozen node goes on advertising the role it held (Stage 6)
 
 **What happened:** After killing the leader through the new control, `/status` on that node

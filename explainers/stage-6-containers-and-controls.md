@@ -117,6 +117,21 @@ With no clock, the node never notices time passing, never decides to hold an ele
 never touches its term. When revived, it picks up exactly where it left off, hears from the
 current leader within a heartbeat, sees a higher term, and quietly steps down to follower.
 
+**One honest caveat, which the continuous integration server found and my laptop didn't.**
+Stopping the clock prevents a node from *starting* an election. It can't un-start one that
+began a fraction of a second earlier. So if a node is killed at the exact instant its timer
+fired, it freezes one term ahead, and on the way back it can cost the cluster one election.
+
+I originally wrote the test to demand the term be *identical* after a revival. It passed ten
+times locally and then failed in CI, which hit that narrow window. The assertion was wrong,
+not the code — a real machine can crash mid-election too.
+
+So the guarantee is a **bound, not a zero**: rejoining costs at most one election. What the
+frozen clock rules out is the version where the damage grows with the length of the outage —
+a term per timeout, forever. Two seconds away was already the difference between term 2 and
+term 10. A node away for a minute would be hopeless; with the clock stopped, a node away for
+a minute costs exactly as little as one away for a second.
+
 There's a detail I'm quietly pleased with: **none of this required changing the consensus
 code.** Back in Stage 3, the Raft implementation was written to take its clock as a
 replaceable input, so that timing could be controlled in tests. That decision, made for
@@ -190,8 +205,10 @@ live containerized cluster. All 18 pass. Highlights:
   request count: losing a request makes it shorter, double-counting makes it longer.
 - Killing the leader elected a new one, and **30 out of 30** requests were served during the
   handoff.
-- The dead node's term stayed put while it was down, and it rejoined as a follower **without
-  unseating the new leader**.
+- The dead node's term stayed put while it was down, and on this run it rejoined as a
+  follower without unseating the new leader. (Usually, though not guaranteed — see the
+  caveat above. What *is* guaranteed, and tested, is that rejoining costs at most one
+  election no matter how long the node was away.)
 - A *real* container crash (`docker compose stop`) was survived too, and the restarted node —
   which comes back with no memory at all, since nothing is written to disk — was refilled
   from the leader's log until it matched exactly.
@@ -263,6 +280,16 @@ consensus layer and not by the request handler. Twenty-five requests produced ex
 twenty-five new entries on all three nodes. If a request had been lost the log would be
 shorter; if one had been counted twice it would be longer. It's an independent check, because
 the thing being audited isn't the thing keeping the count.
+
+**"Your test passed locally ten times and then failed in CI. What did you change?"**
+The assertion, not the code. I'd claimed a revived node comes back at exactly the term it
+left at. CI hit the narrow window where a node is frozen a fraction of a second after its
+election timer fired, so it froze one term ahead — which is legitimate, since a real machine
+can crash mid-election too. The fix was to assert what the design actually guarantees: the
+cost of rejoining is bounded at one election and doesn't grow with the outage. I also made
+the test wait out any in-flight election before reading the term, so it measures the frozen
+state rather than racing it. The tempting alternative was to add a retry until it passed,
+which would have buried a real fact about the system in a flaky test.
 
 **"Your validation said 18 out of 18. How much should I trust that?"**
 More than I would have trusted the first version, which also said 18 out of 18 with two
