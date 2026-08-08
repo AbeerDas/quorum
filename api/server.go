@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/AbeerDas/quorum/fault"
 	"github.com/AbeerDas/quorum/limiter"
 	"github.com/AbeerDas/quorum/metrics"
 	"github.com/AbeerDas/quorum/raft"
@@ -71,6 +73,14 @@ type statusResponse struct {
 	BlockedTotal   uint64 `json:"blocked_total"`
 	UptimeMS       int64  `json:"uptime_ms"`
 
+	// Fault is what has been done to this node on purpose, and DemoControls
+	// says whether it could have been. Both are reported so the dashboard can
+	// distinguish a node that is genuinely unreachable from one somebody
+	// switched off to make a point.
+	Fault        fault.State `json:"fault"`
+	DemoControls bool        `json:"demo_controls"`
+	Swarm        swarmStatus `json:"swarm"`
+
 	// Latency describes recent activity only, so a failover spike shows up and
 	// then recovers rather than being averaged away forever.
 	Latency latencyReport `json:"latency"`
@@ -115,6 +125,11 @@ type ServerConfig struct {
 	// LatencyWindow is the span the /status percentiles describe.
 	LatencyWindow time.Duration
 
+	// Faults enables the demo controls in PRD.md Section 13: the fault
+	// injectors and the built-in load generator. Nil leaves them unregistered,
+	// which is the default - they let an unauthenticated caller stop a node.
+	Faults *fault.Injector
+
 	Logger *slog.Logger
 }
 
@@ -134,6 +149,10 @@ type Server struct {
 	metrics       *metrics.Collector
 	latencyWindow time.Duration
 	logger        *slog.Logger
+
+	faults  *fault.Injector
+	swarmMu sync.Mutex
+	swarm   *swarmRun
 
 	mux *http.ServeMux
 }
@@ -163,6 +182,7 @@ func NewServer(cfg ServerConfig) *Server {
 		metrics:       cfg.Metrics,
 		latencyWindow: cfg.LatencyWindow,
 		logger:        cfg.Logger.With("node_id", cfg.NodeID),
+		faults:        cfg.Faults,
 	}
 
 	mux := http.NewServeMux()
@@ -180,6 +200,12 @@ func NewServer(cfg ServerConfig) *Server {
 	}
 	s.mux = mux
 
+	// The swarm dispatches into the router, so the router has to exist first.
+	if cfg.Faults != nil {
+		s.registerDemoControls(mux)
+		s.logger.Warn("demo controls enabled: /swarm and /admin/* can stop this node, do not expose them")
+	}
+
 	return s
 }
 
@@ -190,6 +216,10 @@ func (s *Server) Handler() http.Handler { return s.mux }
 func (s *Server) handleCheck(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed, use POST")
+		return
+	}
+	if s.down() {
+		s.writeError(w, http.StatusServiceUnavailable, "node is down (simulated fault)")
 		return
 	}
 
@@ -241,6 +271,10 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, http.StatusMethodNotAllowed, "method not allowed, use PUT")
 		return
 	}
+	if s.down() {
+		s.writeError(w, http.StatusServiceUnavailable, "node is down (simulated fault)")
+		return
+	}
 
 	var req configRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -288,6 +322,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		st.Peers = []peerStatus{}
 	}
 
+	// A frozen node's Raft state is whatever it was when it stopped, so a
+	// killed leader would carry on calling itself the leader and the dashboard
+	// would show two at once. Its own view is stale by definition; what is
+	// true about it is that it is down (PRD.md Section 8).
+	if s.down() {
+		st.Role = roleDown
+		st.LeaderID = ""
+	}
+
 	s.writeJSON(w, http.StatusOK, statusResponse{
 		NodeID:   st.NodeID,
 		Mode:     st.Mode,
@@ -304,6 +347,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		BlockedTotal:   s.blocked.Load(),
 		UptimeMS:       at.Sub(s.started).Milliseconds(),
 		Latency:        s.latencyReport(),
+
+		Fault:        s.faultState(),
+		DemoControls: s.faults != nil,
+		Swarm:        s.swarmStatus(),
 	})
 }
 

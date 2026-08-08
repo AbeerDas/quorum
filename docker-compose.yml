@@ -1,0 +1,105 @@
+# A three-node quorumgate cluster.
+#
+#   docker compose up --build
+#
+# The nodes find each other by service name on the compose network. Each serves
+# its REST API on 8080 inside the network, published on 8081-8083 for the host,
+# and carries Raft traffic on 9090, which stays internal.
+#
+# Three nodes is the smallest cluster that can survive losing one: a majority of
+# three is two, so one node can fail and the remaining two still agree.
+#
+# ---------------------------------------------------------------------------
+# The Raft timings below are a set, not three independent knobs. The ordering
+# that has to hold is:
+#
+#     heartbeat  <<  election timeout  <  failover grace
+#
+# A leader under load answers requests before it heartbeats, so heartbeats must
+# have room to arrive late without followers concluding the leader is dead; and
+# a request retrying through a failover has to outlast the election it is
+# waiting on. Stage 8 found that violating this produced a cluster that ran
+# cleanly for 27 seconds and then collapsed into an election storm - which is
+# why they are declared once here and shared by all three nodes rather than
+# copied per service where they could drift apart.
+#
+# These are the calmer values a real deployment would use. quorumd's own
+# defaults are tuned for a snappy demo failover and are not safe under
+# sustained load. Override any of them from the environment, e.g.
+#   ELECTION_MIN=2s docker compose up
+# ---------------------------------------------------------------------------
+
+name: quorumgate
+
+x-node: &node
+  build: .
+  networks: [quorum]
+  restart: unless-stopped
+  # The health check itself lives in the Dockerfile, so the image is honest
+  # about how to check it whether or not compose is what started it.
+
+services:
+  node-1:
+    <<: *node
+    container_name: quorumgate-node-1
+    command:
+      - -node-id=node-1
+      - -addr=:8080
+      - -raft-addr=:9090
+      - -peers=node-2=node-2:9090=node-2:8080,node-3=node-3:9090=node-3:8080
+      - -election-timeout-min=${ELECTION_MIN:-1s}
+      - -election-timeout-max=${ELECTION_MAX:-2s}
+      - -heartbeat=${HEARTBEAT:-100ms}
+      - -failover-grace=${GRACE:-3s}
+      # A limit low enough that a swarm shows allow-then-block within seconds,
+      # and adjustable live from the dashboard through PUT /config.
+      - -limit=${LIMIT:-500}
+      - -window=${WINDOW:-10s}
+      - -log-level=${LOG_LEVEL:-info}
+      # Lets the dashboard stop this node. Safe here because nothing is
+      # published beyond the developer's own machine.
+      - -demo-controls
+    ports:
+      - "8081:8080"
+
+  node-2:
+    <<: *node
+    container_name: quorumgate-node-2
+    command:
+      - -node-id=node-2
+      - -addr=:8080
+      - -raft-addr=:9090
+      - -peers=node-1=node-1:9090=node-1:8080,node-3=node-3:9090=node-3:8080
+      - -election-timeout-min=${ELECTION_MIN:-1s}
+      - -election-timeout-max=${ELECTION_MAX:-2s}
+      - -heartbeat=${HEARTBEAT:-100ms}
+      - -failover-grace=${GRACE:-3s}
+      - -limit=${LIMIT:-500}
+      - -window=${WINDOW:-10s}
+      - -log-level=${LOG_LEVEL:-info}
+      - -demo-controls
+    ports:
+      - "8082:8080"
+
+  node-3:
+    <<: *node
+    container_name: quorumgate-node-3
+    command:
+      - -node-id=node-3
+      - -addr=:8080
+      - -raft-addr=:9090
+      - -peers=node-1=node-1:9090=node-1:8080,node-2=node-2:9090=node-2:8080
+      - -election-timeout-min=${ELECTION_MIN:-1s}
+      - -election-timeout-max=${ELECTION_MAX:-2s}
+      - -heartbeat=${HEARTBEAT:-100ms}
+      - -failover-grace=${GRACE:-3s}
+      - -limit=${LIMIT:-500}
+      - -window=${WINDOW:-10s}
+      - -log-level=${LOG_LEVEL:-info}
+      - -demo-controls
+    ports:
+      - "8083:8080"
+
+networks:
+  quorum:
+    driver: bridge

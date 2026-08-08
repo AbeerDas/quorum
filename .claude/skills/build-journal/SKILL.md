@@ -262,6 +262,70 @@ state the co-location as a limitation, rather than quoting the best number ever 
 Distinguish client-side errors (status 0, connection refused) from server-side ones (503) -
 they mean opposite things about what was actually measured.
 
+### Freezing a node's network is not enough; its clock has to stop too (Stage 6)
+
+**What happened:** The dashboard needs a "kill this node" button that is undoable. The
+obvious build - block the node's traffic in both directions - was wrong in a way that only
+shows up after the node comes back. A node whose network is severed still has a running
+election timer, so it campaigns against peers it cannot reach and raises its term on every
+attempt. Measured: a follower "down" for **2 seconds came back at term 10 while the cluster
+was still at term 1**, and rejoining forced a pointless election among three healthy nodes.
+Passing the injector's own clock to `raft.Config.Clock` and stopping it while frozen fixed
+it: the node resumes exactly where it left off, hears the current leader, and steps down.
+
+**Why:** Raft decides to hold an election because its clock says too much time has passed.
+Cutting the network removes the node's ability to *win* an election but not its motivation
+to *start* one. A suspended machine has no clock advancing, so modelling the fault at the
+clock is both simpler and closer to what a stopped machine actually is.
+
+**Rule going forward:** when simulating a failure, ask what the failing component actually
+stops doing, not just what stops reaching it. And prefer the seam the design already offers
+- `Clock` was an injectable interface from Stage 3, so the entire fault system was built
+without editing one line of consensus code, which is what kept the Stage 3 correctness
+tests meaningful.
+
+### A frozen node goes on advertising the role it held (Stage 6)
+
+**What happened:** After killing the leader through the new control, `/status` on that node
+still reported `role: "leader"`. Every unit test passed. It surfaced only in a live
+three-node run, where a script looking for "the leader" found the dead one first and
+concluded failover had not happened. A dashboard would have drawn two leaders at once.
+
+**Why:** Freezing a node preserves its state, and its state said "leader". That view is
+stale by definition - the node cannot know it has been replaced, because finding out
+requires exactly the traffic that was cut off. The bug was not in the freeze; it was in
+reporting an internal state as though it were a fact about the world. `PRD.md` Section 8
+already had the answer: a node is drawn as leader, follower, **or down**.
+
+**Rule going forward:** when a component is deliberately isolated, its self-report describes
+the past, not the present. Anything aggregating those reports needs a state for "this node
+cannot currently know" rather than trusting the last thing it said. Check every status field
+a fault can invalidate, not just the one the fault was aimed at.
+
+### A validation script proved three nodes agreed by comparing three empty strings (Stage 6)
+
+**What happened:** The Stage 6 validation reported **18 of 18 checks passing**. Two of them
+were worthless. The replication check grepped `/metrics` for `quorumgate_raft_commit_index`,
+but the metric is named `quorum_raft_commit_index` - so it captured empty output from all
+three nodes, compared `"" = "" = ""`, and reported that every node agreed on the commit
+index. The same bug passed the "restarted node was backfilled" check. Fixing the name and
+re-running gave the real evidence: 2476 -> 2501 across 25 requests, identical on all three.
+A second, separate instance of the same class: anchoring the grep with a trailing space
+(`'^quorum_raft_commit_index '`) also matched nothing, because the metric carries a
+`node_id` label and is followed by `{`.
+
+**Why:** Comparing values for equality treats "both absent" as "both agree". Every step of
+the pipeline - curl, grep, awk - succeeds on no matches, so nothing anywhere reports a
+problem. This is the Stage 1 lesson (a suspiciously clean result is a reason to distrust the
+experiment) arriving through a different door, and the Stage 5 lesson (`/metrics` returning
+200 says nothing about the numbers in it) applied to the checker rather than the metric.
+
+**Rule going forward:** any check comparing extracted values must first assert the value was
+extracted - treat empty as failure explicitly, never as a match. Print the values a check
+compared, not just its verdict; the empty output was visible in the log the whole time and
+was only noticed by reading it. And when grepping metrics, match on `[ {]` after the name,
+since a labelled metric is not followed by a space.
+
 ### PRD.md Section 18 names a skill that does not exist (Stage 0)
 
 **What happened:** `npx skills add BjornMelin/dev-skills --skill docker-compose-architecture`

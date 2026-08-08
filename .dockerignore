@@ -1,0 +1,23 @@
+# Keep the build context to what the Go build actually needs. Everything here
+# would otherwise be shipped to the daemon on every build.
+
+.git
+.github
+.claude
+.agents
+
+# The dashboard is built and served separately (Stage 7).
+ui/node_modules
+ui/dist
+
+# Documentation and benchmark tooling play no part in compiling the node.
+*.md
+explainers
+bench
+LICENSE
+skills-lock.json
+
+# Local build output and scratch files.
+quorumd
+*.log
+*.test

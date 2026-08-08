@@ -2,11 +2,41 @@
 
 A fault-tolerant distributed rate limiter in Go, using a hand-written Raft consensus protocol to replicate state across three nodes with automatic leader election and failover.
 
-> **Status:** Stage 0 (repo scaffold). See [`PRD.md`](PRD.md) for the full build spec and stage plan.
+> **Status:** the cluster is complete and runs from a single command. Consensus, replicated
+> rate limiting, observability, containers, fault injection and benchmarks are built and
+> tested; the React dashboard (Stage 7) is not. See [`PRD.md`](PRD.md) for the full build
+> spec and stage plan, and [`explainers/`](explainers/README.md) for plain-language write-ups
+> of what was built at each stage.
+
+## Quick start
+
+```bash
+docker compose up --build
+```
+
+Three nodes come up on ports 8081, 8082 and 8083, find each other, and elect a leader in
+about ten seconds. Every rate-limit decision is agreed by a majority of the cluster before
+it is answered.
+
+```bash
+# Ask any node; a follower forwards the request to the leader.
+curl -s localhost:8081/check -d '{"caller_id":"alice"}'
+# {"allowed":true,"remaining":499}
+
+# Who is the leader right now?
+curl -s localhost:8081/status | python3 -m json.tool
+```
+
+To check the cluster really does what this README claims, run the 18-check validation
+against it — it forms a cluster, replicates, loses its leader, and recovers:
+
+```bash
+./scripts/validate-cluster.sh
+```
 
 ## Architecture
 
-_Architecture diagram goes here — added once the cluster (Stage 3+) exists._
+_Architecture diagram goes here — added with the dashboard in Stage 7._
 
 ## Correctness
 
@@ -68,12 +98,48 @@ The node's default timeouts (75 ms heartbeat, 300-600 ms election) are tuned to 
 
 Related: the API's failover grace must exceed the election timeout. When it did not, in-flight requests aged out during a failover and returned errors; once raised above it, the same failover cost 10 requests out of 90,000.
 
+## Breaking it on purpose
+
+The cluster ships with controls that inject real failures, so "it survives failure" can be
+checked rather than taken on trust. They are **off unless the node is started with
+`-demo-controls`** — they let any caller stop a node, with no authentication — and
+`docker compose` enables them because nothing is published beyond the local machine.
+
+| Control | Simulates | What the cluster does |
+|---|---|---|
+| `POST /admin/kill` | a crashed machine | peers fail instantly, a new leader is elected |
+| `POST /admin/pause` | a hung process | peers wait out their own timeouts before reacting |
+| `POST /admin/delay` | a slow network | still a member, but elections get harder |
+| `POST /admin/revive` | recovery | rejoins as a follower and catches up |
+| `POST /swarm` | client traffic | built-in load generator, no external tool needed |
+
+```bash
+# Watch one greedy caller get cut off while polite ones are untouched.
+curl -s localhost:8081/swarm -d '{"rate":400,"duration_ms":3000,"caller_mix":"one_abusive"}'
+
+# Kill whichever node is currently the leader, then watch the handoff.
+curl -s localhost:8081/admin/kill
+curl -s localhost:8082/status | python3 -m json.tool
+```
+
+A faulted node is frozen rather than disconnected: **its clock stops**. Cutting a node's
+network instead would leave it holding elections against unreachable peers, raising its term
+every time, so reviving it after a minute away would force a pointless election on a healthy
+cluster. Measured, before the fix: a node away for 2 seconds returned at term 10 against a
+cluster still at term 1. Because Raft takes its clock as an injectable dependency, the entire
+fault layer sits outside the consensus code and required no change to it.
+
 ## Repo layout
 
 - `/raft` — hand-rolled Raft consensus core
 - `/limiter` — token-bucket limiter and in-memory store
-- `/api` — external REST API
-- `/ui` — React/Vite dashboard
+- `/api` — external REST API, demo controls, and the built-in load generator
+- `/cluster` — the replicated state machine that puts the limiter behind Raft
+- `/fault` — failure injection: crash, hang, and network delay
+- `/metrics` — Prometheus instrumentation
+- `/scripts` — `validate-cluster.sh`, the live cluster check
+- `/bench` — the benchmark harness behind the numbers above
+- `/ui` — React/Vite dashboard (Stage 7, not yet built)
 
 ## Development
 
@@ -84,5 +150,10 @@ go build ./...
 go test ./...
 go test -race ./...
 ```
+
+The Docker build pins Go to 1.22 and forbids the toolchain from silently upgrading itself
+(`GOTOOLCHAIN=local`), so a successful image build is real evidence that the declared version
+floor holds — a passing CI run alone is not, as [the build journal](.claude/skills/build-journal/SKILL.md)
+records.
 
 See [`PRD.md`](PRD.md) for the complete build spec, API contract, and mandatory stage gates.
